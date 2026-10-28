@@ -1,0 +1,32 @@
+[project]
+name = "SegmentThat"
+description = "Interactive Segmentation of 3D Gaussian Splats."
+version = "0.1.0"
+authors = [
+    {name = "Sevinc Eroglu", email = "sevinc.eroglu@filmakademie.de"}
+]
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_LICENSES.md"]
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+    "numpy>=1.26",
+    "scipy>=1.12",
+    "pillow>=10",
+    "viser>=0.2",
+    "gsplat",
+    "gradio",
+    "matplotlib",
+    "torch>=2.0,<3",
+    "sam3",
+    "setuptools<82",
+    "einops>=0.8.2",
+    "pycocotools>=2.0.11",
+    "psutil>=7.2.2",
+]
+
+[tool.uv.sources]
+sam3 = { git = "https://github.com/facebookresearch/sam3.git" }
