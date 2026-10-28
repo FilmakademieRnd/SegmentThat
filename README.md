@@ -8,7 +8,7 @@ Its Gradio-based interface enables users to interact with the pipeline, refine s
 
 ### Demo Video
 
-![SegmentThat demo](media/SegmentThat.mp4)
+https://github.com/user-attachments/assets/b5df9df2-30d0-4ee4-b236-eeb4d7b09c9a
 
 If the video does not play, [download or open it directly](media/SegmentThat.mp4).
 
