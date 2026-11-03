@@ -325,8 +325,15 @@ def accumulate_view_weights(viewmat, mask, width, height, fx, fy, cx, cy, numer,
     (grad_denom,) = torch.autograd.grad(rc0.sum(), signal, retain_graph=True)
     (grad_numer,) = torch.autograd.grad((rc0 * mask_t).sum(), signal)
     with torch.no_grad():
-        denom += grad_denom.squeeze(1)
-        numer += grad_numer.squeeze(1)
+        vis = grad_denom.squeeze(1)
+        inside = grad_numer.squeeze(1)
+        # One vote per view: the in-mask fraction, weighted by visibility (in pixels of full
+        # coverage) capped at 1 so close views do not outweigh distant ones, while barely
+        # visible Gaussians get a proportionally weaker vote.
+        frac = torch.where(vis > 1e-6, inside / vis.clamp_min(1e-6), torch.zeros_like(vis))
+        w = vis.clamp(0.0, 1.0)
+        denom += w
+        numer += w * frac.clamp(0.0, 1.0)
 
 
 def accumulate_all_pending_views():
