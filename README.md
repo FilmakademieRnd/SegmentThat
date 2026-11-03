@@ -1,7 +1,7 @@
 
 # SegmentThat: Interactive Gaussian Splat Segmentation
 
-**SegmentThat** is a tool that provides an interactive workflow for segmenting and exporting individual objects from 3D Gaussian Splatting (3DGS) scenes. It is developed in the context of the **Industrial Metaverse Reallabor** project, funded by the Ministry of Economics Baden-Württemberg ([project page](https://cli.filmakademie.de/en/research/projects/living-lab-metaverse)).
+**SegmentThat** is a tool that provides an interactive workflow for segmenting and exporting individual objects from pre-trained 3D Gaussian Splatting (3DGS) scenes. It is developed in the context of the **Industrial Metaverse Reallabor** project, funded by the Ministry of Economics Baden-Württemberg ([project page](https://cli.filmakademie.de/en/research/projects/living-lab-metaverse)).
 
 The workflow integrates multi-view 2D segmentation masks, differentiable-rendering-based foreground attribution, and 3D graph-cut optimization to identify individual objects within Gaussian Splatting scenes. 
 Its Gradio-based interface enables users to interact with the pipeline, refine segmentation results, and export segmented objects for further editing and reuse.
@@ -13,6 +13,8 @@ https://github.com/user-attachments/assets/b5df9df2-30d0-4ee4-b236-eeb4d7b09c9a
 If the video does not play, [download or open it directly](media/SegmentThat.mp4), or [watch it on YouTube](https://youtu.be/cyODeUZm8M0?t=34).
 
 ### How It Works
+
+**Input data:** SegmentThat works directly on a pre-trained 3DGS scene stored as a `.ply` file. It does not need the original training images, camera poses, or any retraining. These are often not available, so you can use any existing 3DGS `.ply` file, whether you trained it yourself or got it from someone else. After loading `.ply` file:
 
 1. **Interactive Multi-View Segmentation:** Users select informative viewpoints and specify target objects using text prompts, visual clicks, or a combination of both. [SAM 3](https://github.com/facebookresearch/sam3) generates 2D segmentation masks that users can inspect and refine before proceeding.
 
