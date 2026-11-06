@@ -80,7 +80,10 @@ CUT_BACKGROUND_PRIOR = 0.005
 MAX_CUT_CANDIDATES = 300000
 # SciPy's max-flow needs integer capacities: weights are multiplied by this and rounded.
 CUT_FLOW_SCALE = 1e4
+LEFTOVER_MASK_OVERLAP_THRESHOLD = 0.75
+LEFTOVER_MASK_MIN_VIEWS = 2
 PENDING_HIGHLIGHT_COLOR = (1.0, 0.0, 1.0)
+LEFTOVER_HIGHLIGHT_COLOR = (1.0, 0.6, 0.0)
 CLIP_DEBOUNCE_S = 0.3
 
 # =============================================================================
@@ -113,10 +116,16 @@ loaded_ply_path = None
 sam3_processor = None
 current_viewmat = None
 current_base_image = None
+current_sam_image = None
 current_camera_pose = None
 pending_views = []
 pending_mask_candidate = None
 pending_sam_state = None
+# Previous Segment result for the pending views; kept as candidates when re-segmenting.
+prev_segment = None
+# Unassigned Gaussians found overlapping the pending object's masks; removed from the scene
+# preview and, once the object is confirmed, from the exported scene.
+pending_leftover = np.zeros(0, dtype=np.int64)
 object_records = []
 next_object_id = 1
 scene_center = np.zeros(3, dtype=np.float32)

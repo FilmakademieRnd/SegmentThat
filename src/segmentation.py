@@ -37,7 +37,7 @@ from sam3.model.sam3_image_processor import Sam3Processor
 from scipy import ndimage
 from scipy.sparse import coo_matrix, csr_matrix
 from scipy.sparse.csgraph import breadth_first_order, connected_components, maximum_flow
-from scipy.spatial import cKDTree
+from scipy.spatial import ConvexHull, QhullError, cKDTree
 from scipy.spatial.transform import Rotation
 
 # Local
@@ -57,6 +57,7 @@ from state import (
     CUT_PAIRWISE_WEIGHT,
     CUT_UNARY_WEIGHT,
     DEVICE,
+    LEFTOVER_HIGHLIGHT_COLOR,
     MAX_CUT_CANDIDATES,
     PENDING_HIGHLIGHT_COLOR,
     VOTE_ANCHOR_THRESHOLD,
@@ -229,6 +230,9 @@ def build_display_colors(pending_indices=None):
     if pending_indices is not None and len(pending_indices):
         idx = torch.from_numpy(pending_indices).to(DEVICE)
         vis[idx] = torch.tensor(PENDING_HIGHLIGHT_COLOR, device=DEVICE, dtype=state.colors.dtype)
+    if len(state.pending_leftover):
+        idx = torch.from_numpy(state.pending_leftover).to(DEVICE)
+        vis[idx] = torch.tensor(LEFTOVER_HIGHLIGHT_COLOR, device=DEVICE, dtype=state.colors.dtype)
     return vis
 
 
@@ -246,9 +250,10 @@ def build_inverted_opacities(pending_indices):
     if state.opacities is None:
         return None
     vis = state.opacities.clone()
-    if pending_indices is not None and len(pending_indices):
-        idx = torch.from_numpy(pending_indices).to(DEVICE)
-        vis[idx] = 0
+    confirmed = [r["leftover_indices"] for r in state.object_records]
+    for indices in (pending_indices, state.pending_leftover, *confirmed):
+        if indices is not None and len(indices):
+            vis[torch.from_numpy(indices).to(DEVICE)] = 0
     return vis
 
 
@@ -295,7 +300,7 @@ def spatial_connected_components(xyz, radius):
 
 
 # =============================================================================
-# 5. MULTI-VIEW VOTING AND GRAPH CUT
+# 5. MULTI-VIEW VOTING, GRAPH CUT AND LEFTOVER CLEANUP
 # =============================================================================
 
 
@@ -391,7 +396,7 @@ def min_cut(source, sink, pairs, w):
     return ~source_side[:n]
 
 
-def graph_cut_object(seed_indices, numer, denom):
+def graph_cut_object(seed_indices, numer, denom, extra_candidates=None):
     """Refine seed Gaussians into a 3D object with a min-cut over multi-view votes.
 
     The data term of each Gaussian is scaled by how clearly it was seen in the masked
@@ -416,23 +421,26 @@ def graph_cut_object(seed_indices, numer, denom):
         voted_dist = np.linalg.norm(state.means_cpu[voted] - seed_centroid, axis=1)
         voted = voted[voted_dist <= max_reach]
     anchor = np.union1d(seed_indices, voted) if voted.size else seed_indices
+    protected = anchor
+    if extra_candidates is not None and len(extra_candidates):
+        protected = np.union1d(anchor, extra_candidates)
     xyz = state.means_cpu[anchor]
     centroid = xyz.mean(0)
     extent = float(np.linalg.norm(xyz - centroid, axis=1).max()) if len(xyz) > 1 else 0.0
     nearby = state.full_tree.query_ball_point(
         centroid, min(extent * (1.0 + CUT_BAND_FRACTION) + CUT_BAND_RADIUS, max_reach)
     )
-    candidates = np.unique(np.concatenate([anchor, np.asarray(nearby, dtype=np.int64)]))
+    candidates = np.unique(np.concatenate([protected, np.asarray(nearby, dtype=np.int64)]))
     candidates = candidates[~state.claimed[candidates]]
     if not candidates.size:
         return candidates
     if candidates.size > MAX_CUT_CANDIDATES:
-        is_anchor = np.isin(candidates, anchor)
+        is_anchor = np.isin(candidates, protected)
         s = candidates[is_anchor]
         ns = candidates[~is_anchor]
         budget = max(MAX_CUT_CANDIDATES - len(s), 0)
         if len(ns) > budget:
-            # Keep the Gaussians closest/nearest to the anchors tp avoid holes in the shell.
+            # Keep the Gaussians nearest to the anchors to avoid holes in the shell.
             dist, _ = cKDTree(state.means_cpu[s]).query(state.means_cpu[ns], k=1, workers=-1)
             ns = ns[np.argsort(dist, kind="stable")[:budget]]
         candidates = np.union1d(s, ns)
@@ -471,6 +479,80 @@ def graph_cut_object(seed_indices, numer, denom):
             )
     sink_side = min_cut(source, sink, pairs, w)
     return candidates[~sink_side]
+
+
+def points_inside_hull(points, hull_points, chunk=20000):
+    """Boolean mask of `points` lying inside the convex hull of `hull_points`.
+
+    Returns all False when the hull is degenerate (too few or coplanar points).
+    """
+    inside = np.zeros(len(points), dtype=bool)
+    try:
+        hull = ConvexHull(np.asarray(hull_points, dtype=np.float64))
+    except QhullError:
+        return inside
+    normals = hull.equations[:, :3]
+    offsets = hull.equations[:, 3]
+    for start in range(0, len(points), chunk):
+        block = np.asarray(points[start : start + chunk], dtype=np.float64)
+        inside[start : start + chunk] = ((block @ normals.T + offsets) <= 1e-9).all(axis=1)
+    return inside
+
+
+def find_mask_overlapping_gaussians(
+    means, claimed, object_indices, views, overlap_threshold, min_view_support
+):
+    """Find unclaimed Gaussians inside the object's hull that overlap its masks in several views.
+
+    A candidate's confidence is the share of views, where its centre is in frame, in which it
+    falls inside the mask. Views from the same camera are merged so they count once.
+    """
+    object_xyz = means[object_indices]
+    lower, upper = object_xyz.min(axis=0), object_xyz.max(axis=0)
+    in_box = np.flatnonzero(~claimed & np.all((means >= lower) & (means <= upper), axis=1))
+    candidates = in_box[points_inside_hull(means[in_box], object_xyz)]
+    if not candidates.size:
+        return candidates
+
+    merged = {}
+    for view in views:
+        viewmat = view["viewmat"]
+        if hasattr(viewmat, "detach"):
+            viewmat = viewmat.detach().cpu().numpy()
+        viewmat = np.asarray(viewmat, dtype=np.float64)
+        key = (
+            view["width"],
+            view["height"],
+            view["fx"],
+            view["fy"],
+            view["cx"],
+            view["cy"],
+            tuple(np.round(viewmat, 5).ravel()),
+        )
+        mask = np.asarray(view["mask"], dtype=bool)
+        if key in merged:
+            merged[key][2] |= mask
+        else:
+            merged[key] = [view, viewmat, mask.copy()]
+
+    xyz = means[candidates].astype(np.float64)
+    in_frame_count = np.zeros(len(candidates), dtype=np.int32)
+    inside_count = np.zeros(len(candidates), dtype=np.int32)
+    for view, viewmat, mask in merged.values():
+        cam = xyz @ viewmat[:3, :3].T + viewmat[:3, 3]
+        depth = np.maximum(cam[:, 2], 1e-12)
+        u = view["fx"] * cam[:, 0] / depth + view["cx"]
+        v = view["fy"] * cam[:, 1] / depth + view["cy"]
+        in_frame = (cam[:, 2] > 0) & (u >= 0) & (u < view["width"]) & (v >= 0) & (v < view["height"])
+        in_frame_count += in_frame
+        hit = np.flatnonzero(in_frame)
+        x = np.rint(u[hit]).astype(np.int64).clip(0, view["width"] - 1)
+        y = np.rint(v[hit]).astype(np.int64).clip(0, view["height"] - 1)
+        inside_count[hit] += mask[y, x]
+
+    confidence = inside_count / np.maximum(in_frame_count, 1)
+    remove = (in_frame_count >= min_view_support) & (confidence >= overlap_threshold)
+    return candidates[remove]
 
 
 # =============================================================================

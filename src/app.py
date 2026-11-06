@@ -40,6 +40,7 @@ from segmentation import (
     accumulate_all_pending_views,
     build_display_colors,
     drop_isolated,
+    find_mask_overlapping_gaussians,
     graph_cut_object,
     grow_mask,
     load_ply,
@@ -64,6 +65,8 @@ from state import (
     GRADIO_PORT,
     ISOLATED_MIN_SELECTED,
     ISOLATED_NEIGHBOURS_K,
+    LEFTOVER_MASK_MIN_VIEWS,
+    LEFTOVER_MASK_OVERLAP_THRESHOLD,
     MIN_COMPONENT_SIZE,
     MIN_OBJECT_GAUSSIANS,
     RENDER_HEIGHT,
@@ -114,9 +117,12 @@ def on_load_scene(file_path):
         state.object_records = []
         state.next_object_id = 1
         state.current_base_image = None
+        state.current_sam_image = None
         state.current_viewmat = None
         state.current_camera_pose = None
         state.pending_views.clear()
+        state.pending_leftover = np.zeros(0, dtype=np.int64)
+        state.prev_segment = None
         state.pending_mask_candidate = None
         state.pending_sam_state = None
         state.scene_center = state.means_cpu.mean(axis=0).astype(np.float32)
@@ -167,6 +173,8 @@ def capture_view():
         )
         state.current_viewmat = viewmat_from_camera_pose(client.camera.position, client.camera.wxyz)
         state.current_base_image = render_view(state.current_viewmat, build_display_colors())
+        # SAM must see the true scene colours, not the highlight overlays.
+        state.current_sam_image = render_view(state.current_viewmat)
         state.current_camera_pose = viser_camera_pose_dict(client)
         state.pending_mask_candidate = None
         state.pending_sam_state = None
@@ -196,7 +204,7 @@ def on_image_click(mode, grow_px, evt: gr.SelectData):
     add = mode == "Add (+)"
     try:
         if state.pending_sam_state is None:
-            state.pending_sam_state = new_sam_state(state.current_base_image)
+            state.pending_sam_state = new_sam_state(state.current_sam_image)
         click_mask, score = segment_point_at(state.pending_sam_state, px, py)
         if click_mask is None:
             return state.current_base_image, "SAM3 found no usable mask at that point."
@@ -241,7 +249,7 @@ def on_apply_text_prompt(prompt_text, grow_px):
         return state.current_base_image, "Enter a text prompt first."
     try:
         if state.pending_sam_state is None:
-            state.pending_sam_state = new_sam_state(state.current_base_image)
+            state.pending_sam_state = new_sam_state(state.current_sam_image)
         mask, score = segment_text(state.pending_sam_state, prompt_text)
         if mask is None:
             return state.current_base_image, f"SAM3 found no usable mask for '{prompt_text}'."
@@ -290,6 +298,14 @@ def on_discard_mask():
 
 
 def on_segment(isolate):
+    preview, pending, message = segment_pending_views(isolate)
+    # The orange leftovers changed, so the captured view must be re-rendered.
+    if state.current_viewmat is not None:
+        state.current_base_image = render_view(state.current_viewmat, build_display_colors())
+    return state.current_base_image, preview, pending, message
+
+
+def segment_pending_views(isolate):
     if not state.pending_views:
         return (
             state.current_base_image,
@@ -297,6 +313,7 @@ def on_segment(isolate):
             "No views saved yet. Capture a view, click the object, and Add Mask first.",
         )
     try:
+        state.pending_leftover = np.zeros(0, dtype=np.int64)
         numer_np, denom_np = accumulate_all_pending_views()
         has_evidence = denom_np > 1e-6
         conf_all = np.zeros(state.N, np.float32)
@@ -312,7 +329,13 @@ def on_segment(isolate):
             )
         comp = spatial_connected_components(state.means_cpu[strong], SPATIAL_COMPONENT_RADIUS)
         seed = strong[max(comp, key=len)]
-        final = graph_cut_object(seed, numer_np, denom_np)
+        prev = state.prev_segment
+        final = graph_cut_object(
+            seed,
+            numer_np,
+            denom_np,
+            extra_candidates=prev["indices"] if prev is not None else None,
+        )
         if len(final) < MIN_OBJECT_GAUSSIANS:
             return (
                 state.current_base_image,
@@ -328,6 +351,10 @@ def on_segment(isolate):
             for c in comps:
                 if c is main or len(c) < MIN_COMPONENT_SIZE:
                     continue
+                # When re-segmenting, a separate piece that contains nothing from the previous
+                # selection has no real link to the object, so it is not allowed to attach.
+                if prev is not None and not np.isin(final[c], prev["indices"]).any():
+                    continue
                 d, _ = main_tree.query(state.means_cpu[final[c]], k=1)
                 if d.min() <= COMPONENT_ATTACH_RADIUS:
                     kept.append(c)
@@ -335,6 +362,17 @@ def on_segment(isolate):
             final = final[np.sort(np.concatenate(kept))]
         final, isolated = drop_isolated(final, ISOLATED_NEIGHBOURS_K, ISOLATED_MIN_SELECTED)
         dropped += len(isolated)
+        state.prev_segment = {"indices": final.copy(), "n_views": len(state.pending_views)}
+        claimed_with_final = state.claimed.copy()
+        claimed_with_final[final] = True
+        state.pending_leftover = find_mask_overlapping_gaussians(
+            state.means_cpu,
+            claimed_with_final,
+            final,
+            state.pending_views,
+            LEFTOVER_MASK_OVERLAP_THRESHOLD,
+            LEFTOVER_MASK_MIN_VIEWS,
+        )
         state.preview_viewmat, state.preview_width, state.preview_height, state.preview_k = (
             state.current_viewmat,
             state.WIDTH,
@@ -347,6 +385,12 @@ def on_segment(isolate):
             if dropped
             else ""
         )
+        if len(state.pending_leftover):
+            note += (
+                f" {len(state.pending_leftover):,} unassigned Gaussians overlapping the masks in "
+                f"{LEFTOVER_MASK_MIN_VIEWS}+ views will be removed from the scene (shown orange "
+                "in highlight mode, hidden in 'scene without segmented object')."
+            )
         return (
             selected,
             final,
@@ -444,8 +488,11 @@ def on_confirm(label, pending):
                 "label": label,
                 "gaussian_indices": pending.copy(),
                 "camera_poses": [v["pose"] for v in state.pending_views],
+                "leftover_indices": state.pending_leftover.copy(),
             }
         )
+        state.pending_leftover = np.zeros(0, dtype=np.int64)
+        state.prev_segment = None
         state.current_base_image = render_view(state.current_viewmat, build_display_colors())
         view_count = len(state.pending_views)
         state.pending_views.clear()
@@ -474,9 +521,13 @@ def on_confirm(label, pending):
 
 def on_discard():
     state.pending_views.clear()
+    state.pending_leftover = np.zeros(0, dtype=np.int64)
+    state.prev_segment = None
     state.pending_mask_candidate = None
     state.pending_sam_state = None
     state.preview_viewmat = None
+    if state.current_viewmat is not None:
+        state.current_base_image = render_view(state.current_viewmat, build_display_colors())
     return state.current_base_image, state.current_base_image, None, "Selection discarded."
 
 
@@ -506,6 +557,8 @@ def on_reset():
     state.next_object_id = 1
     state.claimed[:] = False
     state.pending_views.clear()
+    state.pending_leftover = np.zeros(0, dtype=np.int64)
+    state.prev_segment = None
     state.pending_mask_candidate = None
     state.pending_sam_state = None
     state.preview_viewmat = None
@@ -561,18 +614,24 @@ def on_export_scene_without_objects():
         removed = np.zeros(state.N, dtype=bool)
         for r in state.object_records:
             removed[r["gaussian_indices"]] = True
+            removed[r["leftover_indices"]] = True
         remaining = np.flatnonzero(~removed)
         if not remaining.size:
-            return "The labeled objects cover the whole scene; nothing is left to export."
+            return (
+                "The labeled objects and mask-overlap cleanup cover the whole scene; "
+                "nothing is left to export."
+            )
         scene_name = Path(state.loaded_ply_path).stem
         scene_dir = state.OUT_DIR / scene_name
         scene_dir.mkdir(parents=True, exist_ok=True)
         out_path = scene_dir / f"{scene_name}_without_objects.ply"
         write_object_ply(source_ply, remaining, out_path, recenter=False)
+        leftover_count = sum(len(r["leftover_indices"]) for r in state.object_records)
         return (
-            f"Exported the scene without {len(state.object_records)} labeled object(s): "
+            f"Exported the scene without {len(state.object_records)} labeled object(s) and "
+            f"{leftover_count:,} unassigned mask-overlapping Gaussian(s): "
             f"{remaining.size:,} of {state.N:,} Gaussians kept "
-            f"({int(removed.sum()):,} removed).\n{out_path}"
+            f"({int(removed.sum()):,} total removed).\n{out_path}"
         )
     except Exception as e:
         log_exception("Scene export failed")
@@ -664,14 +723,14 @@ def build_ui():
                 refresh_preview_btn = gr.Button("Refresh Preview (from current 3D view)")
                 isolate_toggle = gr.Radio(
                     choices=[
-                        ("Highlight object in scene", "highlight"),
-                        ("Show only segmented object", "isolate"),
-                        ("Show scene without segmented object", "invert"),
+                        ("Highlight", "highlight"),
+                        ("Only object", "isolate"),
+                        ("Scene without object", "invert"),
                     ],
                     value="highlight",
                     label="Preview mode",
                 )
-                preview_image = gr.Image(label="3D Gaussian Selection", interactive=False)
+                preview_image = gr.Image(label="3D Gaussian Preview", interactive=False)
 
         with gr.Row():
             with gr.Column(scale=1):
@@ -727,7 +786,10 @@ def build_ui():
         discard_mask_btn.click(fn=on_discard_mask, inputs=[], outputs=[captured_image, status])
 
         segment_btn.click(
-            fn=on_segment, inputs=[isolate_toggle], outputs=[preview_image, pending_indices, status]
+            fn=on_segment,
+            inputs=[isolate_toggle],
+            outputs=[captured_image, preview_image, pending_indices, status],
+            show_progress_on=[preview_image, status],
         )
 
         refresh_preview_btn.click(
